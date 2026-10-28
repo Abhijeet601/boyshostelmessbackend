@@ -1,0 +1,37 @@
+CREATE TABLE IF NOT EXISTS registration_applications (
+ id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+ reference VARCHAR(40) NOT NULL UNIQUE,
+ admission_number VARCHAR(100) NOT NULL UNIQUE,
+ registration_number VARCHAR(100) NOT NULL UNIQUE,
+ login_id VARCHAR(100) NOT NULL UNIQUE,
+ password_hash VARCHAR(255) NOT NULL,
+ name VARCHAR(150) NOT NULL,
+ email VARCHAR(150) NOT NULL,
+ mobile VARCHAR(30) NOT NULL,
+ hostel VARCHAR(120) NOT NULL,
+ room_number VARCHAR(40) NOT NULL,
+ course VARCHAR(120) NOT NULL,
+ department VARCHAR(120) NOT NULL,
+ academic_year VARCHAR(40) NOT NULL,
+ semester VARCHAR(40) NOT NULL,
+ academic_session VARCHAR(80) NOT NULL,
+ photo_url TEXT NULL,
+ status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+ rejection_reason VARCHAR(1000) NULL,
+ student_id BIGINT UNSIGNED NULL,
+ user_id BIGINT UNSIGNED NULL,
+ reviewed_by BIGINT UNSIGNED NULL,
+ reviewed_at DATETIME NULL,
+ created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+ INDEX ix_registration_scope(hostel,status,created_at),
+ FOREIGN KEY (student_id) REFERENCES students(id),
+ FOREIGN KEY (user_id) REFERENCES users(id),
+ FOREIGN KEY (reviewed_by) REFERENCES users(id)
+) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS registration_photos (
+ id CHAR(48) NOT NULL PRIMARY KEY,
+ application_id BIGINT UNSIGNED NOT NULL,
+ image_base64 MEDIUMTEXT NOT NULL,
+ FOREIGN KEY (application_id) REFERENCES registration_applications(id)
+) ENGINE=InnoDB;
