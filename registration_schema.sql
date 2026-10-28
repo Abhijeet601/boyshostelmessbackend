@@ -28,10 +28,10 @@ CREATE TABLE IF NOT EXISTS registration_applications (
  FOREIGN KEY (student_id) REFERENCES students(id),
  FOREIGN KEY (user_id) REFERENCES users(id),
  FOREIGN KEY (reviewed_by) REFERENCES users(id)
-) ENGINE=InnoDB;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE TABLE IF NOT EXISTS registration_photos (
  id CHAR(48) NOT NULL PRIMARY KEY,
  application_id BIGINT UNSIGNED NOT NULL,
  image_base64 MEDIUMTEXT NOT NULL,
  FOREIGN KEY (application_id) REFERENCES registration_applications(id)
-) ENGINE=InnoDB;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

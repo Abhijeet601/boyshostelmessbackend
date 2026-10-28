@@ -426,6 +426,18 @@ class AttendanceIntegration(unittest.TestCase):
             self.assertFalse(db.execute('SELECT id FROM registration_applications WHERE student_id=?',(student_id,)).fetchone())
         self.assertEqual(self.client.post('/api/student/qr',headers=student).status_code,200)
 
+    def test_mysql_collation_upgrade_preserves_hostel_data(self):
+        from app.db import init_db
+        with get_db() as db:
+            original=db.execute('SELECT id,name FROM hostels ORDER BY id').fetchall()
+            db.execute('ALTER TABLE hostels CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci')
+        self.assertEqual(self.client.get('/api/hostels',headers=self.super).status_code,503)
+        init_db()
+        self.assertEqual(self.client.get('/api/hostels',headers=self.super).status_code,200)
+        with get_db() as db:
+            self.assertEqual(db.execute('SELECT id,name FROM hostels ORDER BY id').fetchall(),original)
+            self.assertEqual(db.execute("SELECT TABLE_COLLATION FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='hostels'").fetchone()['TABLE_COLLATION'],'utf8mb4_unicode_ci')
+
     def test_registration_failed_approval_rolls_back_and_revalidates_hostel(self):
         values,application,credential=self.application()
         with get_db() as db:

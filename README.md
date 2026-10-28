@@ -34,6 +34,10 @@ Student enrollment adds public registration, restricted status tracking, private
 
 `railway.json` and `Procfile` start Uvicorn using the platform's `PORT` variable. Configure the database variables, `APP_SECRET`, and your deployed frontend's exact origin through the hosting platform. The [frontend repository](https://github.com/Abhijeet601/boyshostelmessfrontend) uses `VITE_API_BASE_URL` to select this API when hosted separately.
 
+Database variables belong on the **backend service**, separately from the MySQL service. In Railway's backend Variables editor, reference the MySQL service using `MYSQL_HOST=${{MySQL.MYSQLHOST}}`, `MYSQL_PORT=${{MySQL.MYSQLPORT}}`, `MYSQL_USER=${{MySQL.MYSQLUSER}}`, `MYSQL_PASSWORD=${{MySQL.MYSQLPASSWORD}}`, and `MYSQL_DATABASE=${{MySQL.MYSQLDATABASE}}`. Replace `MySQL` with the actual service name. Local development uses the database's public TCP proxy host and port; a Railway backend in the same project uses the private host and port. A local Git-ignored `.env` does not configure a deployed service.
+
+Application tables explicitly use `utf8mb4_unicode_ci` so student/hostel joins work when the hosting provider defaults to MySQL 8's `utf8mb4_0900_ai_ci`. Startup detects mismatched application tables, creates a full `before-collation-fix` backup, then normalizes those tables without deleting records.
+
 ```sh
 python -m pip install -r requirements-dev.txt
 python -m unittest discover -s tests -p test_attendance.py -v

@@ -98,6 +98,21 @@ def _split_sql(script):
     return [part.strip() for part in script.split(";") if part.strip()]
 
 
+def normalize_collations():
+    # Hosted MySQL databases may default to utf8mb4_0900_ai_ci while the
+    # preserved student/user schema uses utf8mb4_unicode_ci. Joined hostel
+    # names must use the same collation across the application's tables.
+    with get_db() as db:
+        rows = db.execute(f"SELECT TABLE_NAME,TABLE_COLLATION FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME IN ({','.join('?' for _ in CORE_TABLES)})", [MYSQL_DATABASE,*CORE_TABLES]).fetchall()
+    drifted = [row["TABLE_NAME"] for row in rows if row["TABLE_COLLATION"] != "utf8mb4_unicode_ci"]
+    if not drifted:
+        return
+    backup_database("before-collation-fix", all_tables=True)
+    with get_db() as db:
+        for table in drifted:
+            db.execute(f"ALTER TABLE `{table}` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+
+
 def init_db():
     # The configured database already exists in deployments. Creation is safe and idempotent.
     server = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, charset="utf8mb4")
@@ -137,3 +152,4 @@ def init_db():
             db.execute("CREATE UNIQUE INDEX uq_attendance_session ON meal_attendance(student_id,session_id)")
         db.execute("INSERT IGNORE INTO hostels(name) SELECT DISTINCT hostel FROM students WHERE hostel<>''")
         db.execute("INSERT IGNORE INTO hostels(name) SELECT DISTINCT hostel_scope FROM users WHERE hostel_scope IS NOT NULL AND hostel_scope<>''")
+    normalize_collations()
