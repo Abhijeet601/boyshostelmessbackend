@@ -38,6 +38,8 @@ Database variables belong on the **backend service**, separately from the MySQL 
 
 Application tables explicitly use `utf8mb4_unicode_ci` so student/hostel joins work when the hosting provider defaults to MySQL 8's `utf8mb4_0900_ai_ci`. Startup detects mismatched application tables, creates a full `before-collation-fix` backup, then normalizes those tables without deleting records.
 
+Alternatively, set `MYSQL_URL=${{MySQL.MYSQL_URL}}` on the backend service instead of individual connection fields. `DATABASE_URL` and `MYSQL_PUBLIC_URL` are also supported MySQL URL alternatives. Explicit individual fields override their corresponding URL components; remove stale localhost fields when choosing URL-only configuration. Encoded credentials are decoded and connection URLs are omitted from configuration errors.
+
 ```sh
 python -m pip install -r requirements-dev.txt
 python -m unittest discover -s tests -p test_attendance.py -v
