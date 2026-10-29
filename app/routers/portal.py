@@ -2,6 +2,7 @@ import hashlib
 import json
 import secrets
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pymysql
 from fastapi import APIRouter, Depends, HTTPException
@@ -19,7 +20,34 @@ PROFILE_FIELDS = {"name", "email", "mobile", "room_number", "course", "academic_
 
 
 def failure(code, message, status=400, **extra):
-    raise HTTPException(status, jsonable_encoder({"code": code, "message": message, **extra}))
+    raise HTTPException(status, jsonable_encoder({"success": False, "code": code, "message": message, **extra}))
+
+
+def scanner_student(student):
+    """Return only the profile fields needed at an authorized scanner."""
+    fields = ("id", "name", "admission_number", "registration_number", "photo_url", "hostel", "room_number")
+    result = {field: student.get(field) for field in fields}
+    return {**result, "rollNumber": result["admission_number"],
+            "registrationNumber": result["registration_number"],
+            "photoUrl": result["photo_url"], "room": result["room_number"]}
+
+
+def existing_meal_attendance(db, student_id, session):
+    # A current locking read observes a concurrent scanner's committed insert,
+    # even if the earlier QR lookup established an older InnoDB snapshot.
+    return db.execute(
+        "SELECT id,scanned_at,qr_token_id,session_id FROM meal_attendance "
+        "WHERE student_id=? AND meal_date=? AND meal_type=? FOR UPDATE",
+        (student_id, session["session_date"], session["meal"]),
+    ).fetchone()
+
+
+def duplicate_attendance(student, session, attendance, replay=False):
+    marked_at = utc_iso(attendance["scanned_at"])
+    failure("ALREADY_MARKED", "Attendance already marked for this meal", 409,
+            student=scanner_student(student), session=session, meal=session["meal"],
+            attendance_id=attendance["id"], original_time=marked_at,
+            alreadyMarkedAt=marked_at, qr_replay=replay)
 
 
 @router.get("/student/me")
@@ -86,55 +114,86 @@ def heartbeat(mode: str = "hardware", user=Depends(require_auth)):
 
 @router.post("/scanner/consume")
 def consume_qr(payload: QRConsumeRequest, user=Depends(require_auth)):
-    require_roles(user, {"admin", "super-admin"})
-    if not user["scanner_enabled"]:
+    if user["role"] not in {"admin", "super-admin"} or not user["scanner_enabled"]:
         failure("UNAUTHORIZED_SCANNER", "Scanning permission is disabled", 403)
     rate_limit(f"scanner:{user['id']}", 180, 60)
     outcome = "SUCCESS"
     student_id = None
+    student = session = token = None
     try:
         with get_db() as db:
             token = db.execute("SELECT * FROM qr_tokens WHERE token_hash=?", (hashlib.sha256(payload.token.encode()).hexdigest(),)).fetchone()
             if not token:
                 failure("QR_INVALID", "This QR code could not be verified")
-            student = authorize_student(db, user, token["student_id"], lock=True)
+            try:
+                student = authorize_student(db, user, token["student_id"], lock=True)
+            except HTTPException as exc:
+                if exc.status_code == 404:
+                    failure("UNAUTHORIZED_SCANNER", "This scanner cannot check in students outside its authorized hostels", 404)
+                raise
             student_id = student["id"]
             token = db.execute("SELECT * FROM qr_tokens WHERE id=? FOR UPDATE", (token["id"],)).fetchone()
-            if not student["active"] or student["approval_status"] != "APPROVED" or student["deleted_at"] or not student["qr_enabled"]:
-                failure("STUDENT_INACTIVE", "Student account or QR access is inactive", 403)
+            if student["approval_status"] == "SUSPENDED" or student["deleted_at"]:
+                failure("STUDENT_SUSPENDED", "This student account is suspended. Contact an administrator before scanning again.", 403)
+            if student["approval_status"] != "APPROVED":
+                failure("STUDENT_NOT_APPROVED", "This student account has not been approved. Ask an administrator to review the registration.", 403)
+            if not student["active"]:
+                failure("STUDENT_SUSPENDED", "This student account is suspended. Contact an administrator before scanning again.", 403)
+            if not student["qr_enabled"]:
+                failure("STUDENT_INACTIVE", "QR access is disabled for this student", 403)
             if not db.execute("SELECT id FROM users WHERE id=? AND student_id=? AND role='student' AND active=1 FOR UPDATE", (token["user_id"],student_id)).fetchone():
                 failure("STUDENT_INACTIVE", "The linked student account is inactive", 403)
             if not db.execute("SELECT id FROM hostels WHERE name=? AND active=1", (student["hostel"],)).fetchone():
                 failure("NO_ACTIVE_SESSION", "This hostel is not accepting attendance", 422)
             if token["used_at"]:
-                failure("QR_USED", "This QR code has already been used", 409)
+                # A consumed token can explain a current-meal duplicate but can
+                # never authorize another insert, including in a later meal.
+                session = active_session(db, student["hostel"])
+                if session and (not payload.meal or payload.meal == session["meal"]):
+                    existing = existing_meal_attendance(db, student_id, session)
+                    if existing and existing["qr_token_id"] == token["id"]:
+                        duplicate_attendance(student, session, existing, replay=True)
+                failure("QR_USED", "This QR code has already been used. Ask the student to show a fresh live QR.", 409)
             if token["expires_at"] <= datetime.now(timezone.utc).replace(tzinfo=None):
                 failure("QR_EXPIRED", "Ask the student to refresh their live QR", 410)
             session = active_session(db, student["hostel"])
             if not session or (payload.meal and payload.meal != session["meal"]):
                 failure("NO_ACTIVE_SESSION", "No authorized attendance session is currently open", 422)
-            existing = db.execute("SELECT scanned_at FROM meal_attendance WHERE student_id=? AND meal_date=? AND meal_type=?", (student_id, session["session_date"], session["meal"])).fetchone()
+            existing = existing_meal_attendance(db, student_id, session)
             if existing:
-                failure("ALREADY_MARKED", "Attendance Already Marked", 409, original_time=utc_iso(existing["scanned_at"]), student=student, session=session)
+                duplicate_attendance(student, session, existing)
             cursor = db.execute("INSERT INTO meal_attendance(student_id,meal_date,meal_type,scanned_by,qr_token_id,session_id,hostel_at_scan) VALUES (?,?,?,?,?,?,?)", (student_id, session["session_date"], session["meal"], user["id"], token["id"], session["id"], student["hostel"]))
             db.execute("UPDATE qr_tokens SET used_at=UTC_TIMESTAMP() WHERE id=?", (token["id"],))
             repository.audit(user["id"], "attendance_marked", "meal_attendance", cursor.lastrowid, {"student_id": student_id, "session_id": session["id"]}, db=db)
             notify(db, token["user_id"], f"{session['meal']} attendance marked", f"Your {session['meal'].lower()} check-in has been recorded.", "attendance")
-        now = local_now()
-        return {"status": "MARKED", "attendance_id": cursor.lastrowid, "student": student, "meal": session["meal"], "scan_date": session["session_date"], "scan_time": now.strftime("%H:%M:%S"), "scanned_at": now.isoformat()}
+            attendance = db.execute("SELECT scanned_at FROM meal_attendance WHERE id=?", (cursor.lastrowid,)).fetchone()
+        marked_at = utc_iso(attendance["scanned_at"])
+        local_marked_at = datetime.fromisoformat(marked_at).astimezone(ZoneInfo(session["timezone"]))
+        return {"success": True, "code": "MARKED", "status": "MARKED", "attendance_id": cursor.lastrowid, "student": scanner_student(student), "meal": session["meal"], "scan_date": session["session_date"], "scan_time": local_marked_at.strftime("%H:%M:%S"), "scanned_at": marked_at}
     except HTTPException as exc:
         outcome = exc.detail.get("code", "REJECTED") if isinstance(exc.detail, dict) else "REJECTED"
         raise
-    except pymysql.IntegrityError:
-        outcome = "ALREADY_MARKED"
-        failure("ALREADY_MARKED", "Attendance Already Marked", 409)
+    except pymysql.IntegrityError as exc:
+        # The database remains the final guard against simultaneous scanners.
+        # Only a genuine duplicate key with a matching persisted attendance is
+        # a duplicate result; foreign-key and unrelated integrity errors are not.
+        outcome = "SERVER_ERROR"
+        if exc.args and exc.args[0] == 1062 and student_id and session:
+            with get_db() as db:
+                student = authorize_student(db, user, student_id, lock=True)
+                existing = existing_meal_attendance(db, student_id, session)
+                if existing:
+                    outcome = "ALREADY_MARKED"
+                    duplicate_attendance(student, session, existing,
+                                         replay=bool(token and existing["qr_token_id"] == token["id"]))
+        raise
     except Exception:
         outcome = "SERVER_ERROR"
         raise
     finally:
         with get_db() as db:
             db.execute("INSERT INTO scan_events(user_id,student_id,outcome) VALUES (?,?,?)", (user["id"], student_id, outcome))
-            if outcome in {"QR_INVALID","QR_USED","STUDENT_INACTIVE"}:
+            if outcome in {"QR_INVALID","QR_USED","STUDENT_INACTIVE","STUDENT_NOT_APPROVED","STUDENT_SUSPENDED"}:
                 notify(db,user["id"],"QR security notice",f"Your scanner rejected a check-in: {outcome.replace('_',' ').lower()}.","security")
 
 

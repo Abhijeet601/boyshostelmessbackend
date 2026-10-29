@@ -1,6 +1,9 @@
 """Integration suite. Creates and drops only its own isolated MySQL database."""
 import concurrent.futures
 import os
+import hashlib
+import secrets
+import threading
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -87,11 +90,24 @@ class AttendanceIntegration(unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
             results=list(pool.map(lambda _:self.scan(token),range(3)))
         self.assertEqual(sum(r.status_code==200 for r in results),1,[r.text for r in results])
-        self.assertEqual(self.scan(token).json()["detail"]["code"],"QR_USED")
+        replay=self.scan(token).json()["detail"]
+        self.assertEqual(replay["code"],"ALREADY_MARKED")
+        self.assertTrue(replay["qr_replay"])
+        for response in results:
+            if response.status_code != 200:
+                self.assertEqual(response.json()["detail"]["code"],"ALREADY_MARKED")
         duplicate=self.scan(self.qr(student))
         self.assertEqual(duplicate.status_code,409,duplicate.text)
         self.assertEqual(duplicate.json()["detail"]["code"],"ALREADY_MARKED")
         self.assertIn("original_time",duplicate.json()["detail"])
+        self.assertFalse(duplicate.json()["detail"]["qr_replay"])
+        with get_db() as db:
+            row=db.execute("SELECT scanned_at FROM meal_attendance WHERE student_id=?",(student_id,)).fetchone()
+            from app.services import utc_iso
+            self.assertEqual(duplicate.json()["detail"]["original_time"],utc_iso(row["scanned_at"]))
+            self.assertEqual(duplicate.json()["detail"]["alreadyMarkedAt"],utc_iso(row["scanned_at"]))
+            success=next(r.json() for r in results if r.status_code==200)
+            self.assertEqual(success["scanned_at"],utc_iso(row["scanned_at"]))
         with get_db() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) n FROM meal_attendance WHERE student_id=?",(student_id,)).fetchone()["n"],1)
 
@@ -106,7 +122,7 @@ class AttendanceIntegration(unittest.TestCase):
         token=self.qr(student)
         with get_db() as db:
             db.execute("UPDATE students SET active=0 WHERE id=?",(student_id,))
-        self.assertEqual(self.scan(token).json()["detail"]["code"],"STUDENT_INACTIVE")
+        self.assertEqual(self.scan(token).json()["detail"]["code"],"STUDENT_SUSPENDED")
         _,other=self.student("South Residence")
         self.assertEqual(self.scan(self.qr(other)).status_code,404)
 
@@ -407,7 +423,7 @@ class AttendanceIntegration(unittest.TestCase):
         token=self.qr(student)
         self.assertEqual(self.client.post(f'/api/students/{student_id}/account-state',headers=self.admin,json={'active':False,'reason':'Temporary review'}).status_code,200)
         self.assertEqual(self.client.get('/api/auth/me',headers=student).status_code,401)
-        self.assertEqual(self.scan(token).json()['detail']['code'],'STUDENT_INACTIVE')
+        self.assertEqual(self.scan(token).json()['detail']['code'],'STUDENT_SUSPENDED')
         self.assertEqual(self.client.get('/api/registration/status',headers=credential).json()['status'],'SUSPENDED')
         denied=self.client.post('/api/auth/login',json={'login_id':values['login_id'],'password':values['password']})
         self.assertEqual(denied.json()['detail']['code'],'ACCOUNT_SUSPENDED')
@@ -494,13 +510,94 @@ class AttendanceIntegration(unittest.TestCase):
         for day,hour,meal in ((26,8,'Breakfast'),(26,13,'Lunch'),(26,20,'Dinner'),(27,8,'Breakfast')):
             now=datetime(2026,10,day,hour,0,tzinfo=ZoneInfo('Asia/Kolkata'))
             with patch('app.services.local_now',lambda config=None:now):
-                self.assertEqual(self.scan(self.qr(student)).status_code,200)
+                success=self.scan(self.qr(student))
+                self.assertEqual(success.status_code,200,success.text)
+                self.assertEqual(success.json()['meal'],meal)
                 duplicate=self.scan(self.qr(student))
                 self.assertEqual(duplicate.status_code,409,duplicate.text)
                 self.assertEqual(duplicate.json()['detail']['code'],'ALREADY_MARKED')
                 self.assertEqual(duplicate.json()['detail']['session']['meal'],meal)
+                detail=duplicate.json()['detail']
+                self.assertFalse(detail['success'])
+                self.assertEqual(detail['meal'],meal)
+                self.assertEqual(detail['student']['id'],student_id)
+                self.assertEqual(detail['student']['name'],'Integration Student')
+                self.assertEqual(detail['student']['hostel'],'North Residence')
+                self.assertEqual(detail['student']['room_number'],'101')
+                self.assertTrue(detail['student']['admission_number'].startswith('ADM-'))
+                self.assertTrue(detail['student']['registration_number'].startswith('REG-'))
+                self.assertIn('photo_url',detail['student'])
+                self.assertEqual(detail['alreadyMarkedAt'],success.json()['scanned_at'])
+                self.assertNotIn('password_hash',detail['student'])
         with get_db() as db:
             self.assertEqual(db.execute('SELECT COUNT(*) n FROM meal_attendance WHERE student_id=?',(student_id,)).fetchone()['n'],4)
+
+    def test_cross_meal_replay_and_expired_duplicate_preserve_token_security(self):
+        self.lunch()
+        student_id,student=self.student()
+        token=self.qr(student)
+        self.assertEqual(self.scan(token).status_code,200)
+        # A consumed lunch QR cannot mark dinner or disclose a dinner duplicate.
+        dinner=datetime(2026,10,26,20,0,tzinfo=ZoneInfo('Asia/Kolkata'))
+        with patch('app.services.local_now',lambda config=None:dinner):
+            self.assertEqual(self.scan(token).json()['detail']['code'],'QR_USED')
+            self.assertEqual(self.scan(self.qr(student)).status_code,200)
+            self.assertEqual(self.scan(token).json()['detail']['code'],'QR_USED')
+        fresh=self.qr(student)
+        with get_db() as db:
+            db.execute('UPDATE qr_tokens SET expires_at=UTC_TIMESTAMP()-INTERVAL 1 SECOND WHERE token_hash=?',(hashlib.sha256(fresh.encode()).hexdigest(),))
+        self.assertEqual(self.scan(fresh).json()['detail']['code'],'QR_EXPIRED')
+        with get_db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) n FROM meal_attendance WHERE student_id=?',(student_id,)).fetchone()['n'],2)
+
+    def test_distinct_tokens_two_scanners_and_database_unique_constraints(self):
+        import pymysql
+        self.lunch()
+        student_id,student=self.student()
+        tokens=[secrets.token_urlsafe(32) for _ in range(4)]
+        with get_db() as db:
+            user_id=db.execute("SELECT id FROM users WHERE student_id=? AND role='student'",(student_id,)).fetchone()['id']
+            for token in tokens:
+                db.execute('INSERT INTO qr_tokens(token_hash,student_id,user_id,expires_at) VALUES (?,?,?,UTC_TIMESTAMP()+INTERVAL 30 SECOND)',(hashlib.sha256(token.encode()).hexdigest(),student_id,user_id))
+        barrier=threading.Barrier(len(tokens))
+        def concurrent_scan(item):
+            index,token=item
+            barrier.wait(timeout=10)
+            return self.scan(token,headers=self.admin if index%2 else self.super)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(tokens)) as pool:
+            results=list(pool.map(concurrent_scan,enumerate(tokens)))
+        self.assertEqual(sum(r.status_code==200 for r in results),1,[r.text for r in results])
+        self.assertEqual(sum(r.status_code==409 and r.json()['detail']['code']=='ALREADY_MARKED' for r in results),3,[r.text for r in results])
+        with get_db() as db:
+            row=db.execute('SELECT * FROM meal_attendance WHERE student_id=?',(student_id,)).fetchone()
+            self.assertEqual(db.execute('SELECT COUNT(*) n FROM meal_attendance WHERE student_id=?',(student_id,)).fetchone()['n'],1)
+            unused=db.execute('SELECT id FROM qr_tokens WHERE student_id=? AND used_at IS NULL LIMIT 1',(student_id,)).fetchone()['id']
+            indexes=db.execute("SHOW INDEX FROM meal_attendance WHERE Key_name='uq_attendance_session'").fetchall()
+            self.assertEqual([i['Column_name'] for i in sorted(indexes,key=lambda i:i['Seq_in_index'])],['student_id','session_id'])
+            self.assertTrue(all(i['Non_unique']==0 for i in indexes))
+            self.assertEqual(db.execute("SELECT COUNT(*) n FROM scan_events WHERE student_id=? AND outcome IN ('SUCCESS','ALREADY_MARKED')",(student_id,)).fetchone()['n'],4)
+        # Different meal/date bypasses the legacy constraint; the session constraint
+        # must still independently reject this direct database write.
+        with self.assertRaises(pymysql.IntegrityError) as raised:
+            with get_db() as db:
+                db.execute("INSERT INTO meal_attendance(student_id,meal_date,meal_type,scanned_by,qr_token_id,session_id,hostel_at_scan) VALUES (?,?,'Dinner',?,?,?,?)",(student_id,row['meal_date'],row['scanned_by'],unused,row['session_id'],row['hostel_at_scan']))
+        self.assertEqual(raised.exception.args[0],1062)
+        with get_db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) n FROM meal_attendance WHERE student_id=?',(student_id,)).fetchone()['n'],1)
+
+    def test_scan_distinguishes_not_approved_suspended_and_disabled_qr(self):
+        self.lunch()
+        student_id,student=self.student()
+        token=self.qr(student)
+        for changes,code in (({'approval_status':'PENDING'},'STUDENT_NOT_APPROVED'),({'approval_status':'APPROVED','active':0},'STUDENT_SUSPENDED'),({'active':1,'qr_enabled':0},'STUDENT_INACTIVE')):
+            with get_db() as db:
+                for field,value in changes.items():
+                    db.execute(f'UPDATE students SET {field}=? WHERE id=?',(value,student_id))
+            response=self.scan(token)
+            self.assertEqual(response.status_code,403,response.text)
+            self.assertEqual(response.json()['detail']['code'],code)
+        with get_db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) n FROM meal_attendance WHERE student_id=?',(student_id,)).fetchone()['n'],0)
 
 
 if __name__=="__main__":
